@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import inquirer from "inquirer";
-import ytdl from "ytdl-core";
+import { video_info, stream, validate, InfoData, YouTubeStream } from "play-dl";
 import ora from "ora";
 import fs from "fs";
 import path from "path";
@@ -16,50 +16,45 @@ import {
   DownloadError,
   FileSystemError,
   ValidationError,
-} from "./errors";
-import { debugLog } from "./utils/logger";
+} from "./types/errors";
+import { logger } from "./utils/logger";
+import { Stream } from "stream";
+
+// Define download directory
+const DOWNLOAD_DIR = path.join(process.cwd(), "videos");
+
+// Ensure download directory exists
+function ensureDownloadDirectory(): void {
+  if (!fs.existsSync(DOWNLOAD_DIR)) {
+    fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+    logger.info(`Created download directory: ${DOWNLOAD_DIR}`);
+  }
+}
 
 async function validateYouTubeUrl(url: string): Promise<boolean> {
   try {
     if (!url) {
       throw new ValidationError("URL cannot be empty");
     }
-    return ytdl.validateURL(url);
+    return (await validate(url)) === "yt_video";
   } catch (error) {
-    debugLog("URL Validation Error:", error);
+    logger.error("URL Validation Error:", error);
     return false;
   }
 }
 
-async function getVideoInfo(url: string): Promise<ytdl.videoInfo> {
+async function getVideoInfo(url: string): Promise<InfoData> {
   try {
-    debugLog("Fetching video info for:", url);
-    const info = await ytdl.getInfo(url, {
-      requestOptions: {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-          Cookie: "CONSENT=YES+",
-        },
-      },
-    });
-    debugLog("Video info fetched successfully");
+    logger.info(`Fetching video info for: ${url}`);
+    const info = await video_info(url);
+    logger.success("Video info fetched successfully");
     return info;
   } catch (error: unknown) {
-    debugLog("Error fetching video info:", error);
+    logger.error("Error fetching video info:", error);
     if (error instanceof Error) {
       if (error.message.includes("age-restricted")) {
         throw new VideoInfoError(
           "This video is age-restricted and cannot be downloaded",
-          error
-        );
-      }
-      if (error.message.includes("Could not extract")) {
-        throw new VideoInfoError(
-          "YouTube made changes that prevent downloading. Please update ytdl-core",
           error
         );
       }
@@ -70,7 +65,7 @@ async function getVideoInfo(url: string): Promise<ytdl.videoInfo> {
     }
     throw new VideoInfoError(
       "An unknown error occurred while getting video information",
-      new Error(String(error))
+      error
     );
   }
 }
@@ -79,150 +74,162 @@ async function downloadVideo(
   options: DownloadOptions
 ): Promise<DownloadResult> {
   const spinner = ora("Starting download...").start();
-  let cleanup: (() => void) | null = null;
+  let startTime = Date.now();
 
   try {
-    debugLog("Starting download with options:", options);
-    const info = await getVideoInfo(options.url);
+    // Ensure download directory exists
+    ensureDownloadDirectory();
 
-    const sanitizedTitle = info.videoDetails.title
-      .replace(/[/\\?%*:|"<>]/g, "-")
-      .substring(0, 200);
+    logger.info("Starting video download", { options });
+    const info = await video_info(options.url);
+
+    // Sanitize filename
+    const sanitizedTitle = info.video_details.title
+      ? info.video_details.title
+          .replace(/[/\\?%*:|"<>]/g, "-")
+          .substring(0, 200)
+      : "video";
 
     const filename = `${sanitizedTitle}.${
       options.format === "audio" ? "mp3" : "mp4"
     }`;
 
-    debugLog("Creating write stream for:", filename);
-    const writeStream = fs.createWriteStream(filename);
-    let starttime = Date.now();
+    // Create full file path in videos directory
+    const filePath = path.join(DOWNLOAD_DIR, filename);
 
-    // Setup cleanup function
-    cleanup = () => {
-      try {
-        if (fs.existsSync(filename)) {
-          fs.unlinkSync(filename);
-          debugLog("Cleaned up incomplete file:", filename);
-        }
-      } catch (error) {
-        debugLog("Error during cleanup:", error);
-      }
-    };
+    const writeStream = fs.createWriteStream(filePath);
+    let downloadedBytes = 0;
+    let totalBytes = 0;
 
-    const stream = ytdl(options.url, {
-      filter:
-        options.format === "audio"
-          ? "audioonly"
-          : (format) => format.hasVideo && format.hasAudio,
-      quality: options.format === "audio" ? "highestaudio" : "highest",
-      requestOptions: {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-          Cookie: "CONSENT=YES+",
-        },
-      },
+    // Get the stream based on format
+    const videoStream = await stream(options.url, {
+      quality: options.format === "audio" ? 140 : 720, // 140 for audio M4A, 720p for video
+      ...(options.format === "audio"
+        ? { discordPlayerCompatibility: true }
+        : {}),
     });
 
-    return new Promise((resolve, reject) => {
-      let downloadedBytes = 0;
-      let totalBytes = 0;
-      let lastUpdate = Date.now();
+    // Set up progress tracking
+    let lastBytes = 0;
+    let lastTime = Date.now();
+    const updateInterval = setInterval(() => {
+      const currentBytes = downloadedBytes;
+      const currentTime = Date.now();
+      const bytesPerSecond =
+        (currentBytes - lastBytes) / ((currentTime - lastTime) / 1000);
+      lastBytes = currentBytes;
+      lastTime = currentTime;
 
-      stream.on("progress", (_, downloaded, total) => {
-        downloadedBytes = downloaded;
-        totalBytes = total;
-        const now = Date.now();
-        const progress: DownloadProgress = {
-          downloadedBytes: downloaded,
-          totalBytes: total,
-          percentage: (downloaded / total) * 100,
-          speed: downloaded / ((now - starttime) / 1000),
-        };
+      const progress: DownloadProgress = {
+        downloadedBytes: currentBytes,
+        totalBytes: totalBytes || 0,
+        percentage: totalBytes ? (currentBytes / totalBytes) * 100 : 0,
+        speed: bytesPerSecond,
+      };
 
-        if (now - lastUpdate > 1000) {
-          // Update not more than once per second
-          spinner.text = `Downloading... ${progress.percentage.toFixed(2)}% (${(
-            progress.speed /
-            1024 /
-            1024
-          ).toFixed(2)} MB/s)`;
-          lastUpdate = now;
-        }
-        debugLog("Download progress:", progress);
-      });
+      const percent = progress.percentage.toFixed(2);
+      const speed = (bytesPerSecond / 1024 / 1024).toFixed(2); // Convert to MB/s
+      spinner.text = `Downloading... ${percent}% (${speed} MB/s)`;
 
-      stream.pipe(writeStream);
+      logger.info("Download progress", progress);
+    }, 1000);
 
+    // Set up promise to handle stream completion
+    const downloadPromise = new Promise<DownloadResult>((resolve, reject) => {
       writeStream.on("finish", () => {
-        const endtime = Date.now();
-        const seconds = (endtime - starttime) / 1000;
-        spinner.succeed(
-          `Download completed in ${seconds.toFixed(
-            2
-          )}s! File saved as: ${filename}`
-        );
-
+        clearInterval(updateInterval);
+        const endTime = Date.now();
+        const duration = (endTime - startTime) / 1000; // seconds
         const result: DownloadResult = {
-          filename,
-          duration: seconds,
+          filename: filename,
+          filePath: filePath,
+          duration,
           format: options.format,
-          size: downloadedBytes,
+          size: totalBytes,
         };
-        debugLog("Download completed:", result);
+        spinner.succeed(
+          `Download completed in ${duration.toFixed(
+            2
+          )}s! File saved in videos/${filename}`
+        );
+        logger.success("Download completed", result);
         resolve(result);
       });
 
-      stream.on("error", (error: Error) => {
-        debugLog("Stream error:", error);
-        cleanup?.();
-        reject(new DownloadError("Error during download", error));
+      videoStream.stream.on("error", (error: Error) => {
+        clearInterval(updateInterval);
+        spinner.fail("Download error occurred!");
+        const downloadError = new DownloadError("Stream error occurred", error);
+        logger.error(downloadError);
+
+        // Clean up partial file
+        if (fs.existsSync(filePath)) {
+          try {
+            fs.unlinkSync(filePath);
+            logger.info("Cleaned up partial download file");
+          } catch (unlinkError) {
+            logger.error(
+              new FileSystemError(
+                "Failed to clean up partial file",
+                unlinkError
+              )
+            );
+          }
+        }
+        reject(downloadError);
       });
 
       writeStream.on("error", (error: Error) => {
-        debugLog("Write stream error:", error);
-        cleanup?.();
-        reject(new FileSystemError("Error writing to file", error, filename));
+        clearInterval(updateInterval);
+        spinner.fail("Error writing file!");
+        const fsError = new FileSystemError("Write stream error", error);
+        logger.error(fsError);
+        reject(fsError);
       });
     });
+
+    // Pipe the stream and handle data events for progress
+    videoStream.stream.on("data", (chunk: Buffer) => {
+      downloadedBytes += chunk.length;
+    });
+
+    videoStream.stream.pipe(writeStream);
+    return await downloadPromise;
   } catch (error: unknown) {
-    debugLog("Download error:", error);
-    cleanup?.();
     spinner.fail("Download failed!");
     if (error instanceof YouTubeDownloaderError) {
+      logger.error(error);
       throw error;
+    } else if (error instanceof Error) {
+      const downloadError = new DownloadError(
+        "Download failed with unknown error",
+        error
+      );
+      logger.error(downloadError);
+      throw downloadError;
+    } else {
+      const unknownError = new DownloadError(
+        "Download failed with unknown error",
+        new Error(String(error))
+      );
+      logger.error(unknownError);
+      throw unknownError;
     }
-    if (error instanceof Error) {
-      throw new DownloadError("Download failed", error);
-    }
-    throw new DownloadError(
-      "An unknown error occurred",
-      new Error(String(error))
-    );
   }
 }
 
 async function main() {
   try {
-    debugLog("Starting application");
+    logger.info("Starting YouTube Downloader");
+
     const answers = await inquirer.prompt([
       {
         type: "input",
         name: "url",
         message: "Enter YouTube video URL:",
         validate: async (input) => {
-          try {
-            const isValid = await validateYouTubeUrl(input);
-            return isValid ? true : "Please enter a valid YouTube URL";
-          } catch (error) {
-            if (error instanceof ValidationError) {
-              return error.message;
-            }
-            return "Invalid URL format";
-          }
+          const isValid = await validateYouTubeUrl(input);
+          return isValid ? true : "Please enter a valid YouTube URL";
         },
       },
       {
@@ -238,31 +245,39 @@ async function main() {
       format: answers.format as "video" | "audio",
     });
 
-    debugLog("Download completed successfully:", result);
+    logger.success("Process completed successfully", result);
   } catch (error: unknown) {
     if (error instanceof YouTubeDownloaderError) {
-      console.error(`${error.name} (${error.code}):`, error.message);
-      debugLog("Application error details:", error);
+      logger.error(error);
     } else if (error instanceof Error) {
-      console.error("Unexpected error:", error.message);
-      debugLog("Unexpected error details:", error);
+      logger.error(
+        new YouTubeDownloaderError(error.message, "UNKNOWN_ERROR", error)
+      );
     } else {
-      console.error("An unknown error occurred");
-      debugLog("Unknown error:", error);
+      logger.error(
+        new YouTubeDownloaderError(
+          "An unknown error occurred",
+          "UNKNOWN_ERROR",
+          error
+        )
+      );
     }
     process.exit(1);
   }
 }
 
-// Add debug mode detection
-const DEBUG_MODE = process.env.DEBUG === "true";
+// Handle uncaught errors
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught Exception:", error);
+  process.exit(1);
+});
 
-if (DEBUG_MODE) {
-  console.log("Debug mode enabled");
-}
+process.on("unhandledRejection", (reason) => {
+  logger.error("Unhandled Rejection:", reason);
+  process.exit(1);
+});
 
 main().catch((error) => {
-  debugLog("Uncaught error:", error);
-  console.error("Fatal error:", error);
+  logger.error("Application error:", error);
   process.exit(1);
 });

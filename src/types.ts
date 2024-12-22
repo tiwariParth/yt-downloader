@@ -1,5 +1,3 @@
-import { videoInfo } from "ytdl-core";
-
 export interface VideoFormat {
   quality: string;
   hasAudio: boolean;
@@ -23,6 +21,7 @@ export interface DownloadProgress {
 
 export interface DownloadResult {
   filename: string;
+  filePath: string;
   duration: number; // in seconds
   format: string;
   size: number; // in bytes

@@ -16,14 +16,14 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "chalk": "4.1.2",
-    "inquirer": "8.2.6",
-    "ora": "5.4.1",
-    "ytdl-core": "4.11.5"
+    "chalk": "5.4.1",
+    "inquirer": "12.3.0",
+    "ora": "8.1.1",
+    "play-dl": "^1.9.7"
   },
   "devDependencies": {
-    "@types/inquirer": "8.2.6",
-    "@types/node": "18.18.0",
+    "@types/inquirer": "9.0.7",
+    "@types/node": "22.0.1",
     "ts-node": "10.9.2",
     "ts-node-dev": "2.0.0",
     "typescript": "5.0.4"

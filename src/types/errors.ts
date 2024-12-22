@@ -25,3 +25,10 @@ export class FileSystemError extends YouTubeDownloaderError {
     this.name = "FileSystemError";
   }
 }
+
+export class ValidationError extends YouTubeDownloaderError {
+  constructor(message: string, details?: any) {
+    super(message, "VALIDATION_ERROR", details);
+    this.name = "ValidationError";
+  }
+}
