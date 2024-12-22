@@ -76,18 +76,39 @@ async function downloadVideo(
     const info = await video_info(options.url);
     const streamFormats = info.format;
 
+    const availableQualities = streamFormats
+      .map((format) => format.itag)
+      .filter((itag) => typeof itag === "number") as number[];
+
+    logger.info(`Available qualities: ${availableQualities.join(", ")}`);
+
+    // Updated quality selection logic
     let quality: number;
     if (options.format === "audio") {
-      quality = 251; // Changed to 251 for better audio quality (WebM Opus)
+      // Audio quality priority: 251 (Opus) > 140 (m4a) > 250 > 249
+      const audioQualities = [251, 140, 250, 249];
+      quality =
+        audioQualities.find((q) => availableQualities.includes(q)) || 140;
     } else {
-      const availableQualities = streamFormats
-        .map((format) => format.itag)
-        .filter((itag) => typeof itag === "number") as number[];
-
-      logger.info(`Available qualities: ${availableQualities.join(", ")}`);
-      // Try to get the best available video quality
-      quality = availableQualities.includes(22) ? 22 : 18; // 720p(22) or 360p(18)
+      // Video quality priority (new format codes)
+      const videoQualities = [
+        303, // 1080p
+        299, // 1080p
+        399, // 1080p
+        136, // 720p
+        247, // 720p
+        298, // 720p
+        135, // 480p
+        244, // 480p
+        134, // 360p
+        243, // 360p
+        18, // 360p (fallback)
+      ];
+      quality =
+        videoQualities.find((q) => availableQualities.includes(q)) || 18;
     }
+
+    logger.info(`Selected quality itag: ${quality}`);
 
     const sanitizedTitle = info.video_details.title
       ? info.video_details.title
@@ -100,7 +121,6 @@ async function downloadVideo(
     }`;
     const filePath = path.join(DOWNLOAD_DIR, filename);
 
-    // Get format info for progress calculation
     const selectedFormat = streamFormats.find(
       (format) => format.itag === quality
     );
@@ -111,32 +131,47 @@ async function downloadVideo(
       );
     }
 
-    logger.info(`Starting download with quality itag: ${quality}`);
+    const videoStream = await stream(options.url, {
+      quality,
+      ...(options.format === "audio"
+        ? { discordPlayerCompatibility: true }
+        : {}),
+    });
 
-    const videoStream = await stream(options.url, { quality });
     const writeStream = fs.createWriteStream(filePath);
     let downloadedBytes = 0;
     const totalBytes = selectedFormat.contentLength
       ? parseInt(selectedFormat.contentLength)
-      : (info.video_details.durationInSec * 128000) / 8; // Estimate size for audio
+      : (info.video_details.durationInSec *
+          (options.format === "audio" ? 128000 : 512000)) /
+        8;
 
-    const updateProgress = () => {
-      if (totalBytes) {
+    return new Promise((resolve, reject) => {
+      const updateProgress = () => {
         const percent = ((downloadedBytes / totalBytes) * 100).toFixed(2);
         const downloaded = (downloadedBytes / 1024 / 1024).toFixed(2);
         const total = (totalBytes / 1024 / 1024).toFixed(2);
         spinner.text = `Downloading... ${percent}% (${downloaded}MB / ${total}MB)`;
-      } else {
-        spinner.text = `Downloading... ${(
-          downloadedBytes /
-          1024 /
-          1024
-        ).toFixed(2)}MB`;
-      }
-    };
+        logger.info("Download progress", {
+          downloadedBytes,
+          totalBytes,
+          percent,
+        });
+      };
 
-    return new Promise((resolve, reject) => {
       const progressInterval = setInterval(updateProgress, 1000);
+
+      const cleanup = () => {
+        clearInterval(progressInterval);
+        if (fs.existsSync(filePath)) {
+          try {
+            fs.unlinkSync(filePath);
+            logger.info("Cleaned up partial download file");
+          } catch (error) {
+            logger.error("Failed to clean up file:", error);
+          }
+        }
+      };
 
       videoStream.stream
         .on("data", (chunk: Buffer) => {
@@ -146,11 +181,8 @@ async function downloadVideo(
           clearInterval(progressInterval);
         })
         .on("error", (error: Error) => {
-          clearInterval(progressInterval);
+          cleanup();
           spinner.fail("Download error occurred!");
-          if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-          }
           reject(new DownloadError("Stream error occurred", error));
         });
 
@@ -173,11 +205,8 @@ async function downloadVideo(
           resolve(result);
         })
         .on("error", (error: Error) => {
-          clearInterval(progressInterval);
+          cleanup();
           spinner.fail("Error writing file!");
-          if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-          }
           reject(new FileSystemError("Write stream error", error));
         });
 
