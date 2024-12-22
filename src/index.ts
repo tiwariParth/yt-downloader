@@ -83,6 +83,28 @@ async function downloadVideo(
     logger.info("Starting video download", { options });
     const info = await video_info(options.url);
 
+    // Get available formats
+    const streamFormats = info.format;
+
+    // Choose appropriate quality
+    let quality: number = 136; // Default to 720p if no preferred quality is available
+    if (options.format === "audio") {
+      // Use 140 for M4A audio
+      quality = 140;
+    } else {
+      // For video, try to get 1080p, fallback to lower qualities
+      const videoQualities = [137, 136, 135, 134]; // 1080p, 720p, 480p, 360p
+      for (const q of videoQualities) {
+        if (streamFormats.find((format) => format.itag === q)) {
+          quality = q;
+          break;
+        }
+      }
+      quality = quality || 136; // Default to 720p if no preferred quality is available
+    }
+
+    logger.info(`Selected quality itag: ${quality}`);
+
     // Sanitize filename
     const sanitizedTitle = info.video_details.title
       ? info.video_details.title
@@ -97,17 +119,17 @@ async function downloadVideo(
     // Create full file path in videos directory
     const filePath = path.join(DOWNLOAD_DIR, filename);
 
-    const writeStream = fs.createWriteStream(filePath);
-    let downloadedBytes = 0;
-    let totalBytes = 0;
-
-    // Get the stream based on format
+    // Get the stream
     const videoStream = await stream(options.url, {
-      quality: options.format === "audio" ? 140 : 720, // 140 for audio M4A, 720p for video
+      quality,
       ...(options.format === "audio"
         ? { discordPlayerCompatibility: true }
         : {}),
     });
+
+    const writeStream = fs.createWriteStream(filePath);
+    let downloadedBytes = 0;
+    let totalBytes = info.video_details.durationInSec || 0;
 
     // Set up progress tracking
     let lastBytes = 0;
@@ -122,7 +144,7 @@ async function downloadVideo(
 
       const progress: DownloadProgress = {
         downloadedBytes: currentBytes,
-        totalBytes: totalBytes || 0,
+        totalBytes: totalBytes,
         percentage: totalBytes ? (currentBytes / totalBytes) * 100 : 0,
         speed: bytesPerSecond,
       };
@@ -145,7 +167,7 @@ async function downloadVideo(
           filePath: filePath,
           duration,
           format: options.format,
-          size: totalBytes,
+          size: downloadedBytes,
         };
         spinner.succeed(
           `Download completed in ${duration.toFixed(
@@ -154,29 +176,6 @@ async function downloadVideo(
         );
         logger.success("Download completed", result);
         resolve(result);
-      });
-
-      videoStream.stream.on("error", (error: Error) => {
-        clearInterval(updateInterval);
-        spinner.fail("Download error occurred!");
-        const downloadError = new DownloadError("Stream error occurred", error);
-        logger.error(downloadError);
-
-        // Clean up partial file
-        if (fs.existsSync(filePath)) {
-          try {
-            fs.unlinkSync(filePath);
-            logger.info("Cleaned up partial download file");
-          } catch (unlinkError) {
-            logger.error(
-              new FileSystemError(
-                "Failed to clean up partial file",
-                unlinkError
-              )
-            );
-          }
-        }
-        reject(downloadError);
       });
 
       writeStream.on("error", (error: Error) => {
@@ -188,12 +187,35 @@ async function downloadVideo(
       });
     });
 
-    // Pipe the stream and handle data events for progress
+    // Handle stream errors
+    videoStream.stream.on("error", (error: Error) => {
+      clearInterval(updateInterval);
+      spinner.fail("Download error occurred!");
+      const downloadError = new DownloadError("Stream error occurred", error);
+      logger.error(downloadError);
+
+      // Clean up partial file
+      if (fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+          logger.info("Cleaned up partial download file");
+        } catch (unlinkError) {
+          logger.error(
+            new FileSystemError("Failed to clean up partial file", unlinkError)
+          );
+        }
+      }
+      throw downloadError;
+    });
+
+    // Track download progress
     videoStream.stream.on("data", (chunk: Buffer) => {
       downloadedBytes += chunk.length;
     });
 
+    // Start the download
     videoStream.stream.pipe(writeStream);
+
     return await downloadPromise;
   } catch (error: unknown) {
     spinner.fail("Download failed!");
