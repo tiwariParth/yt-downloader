@@ -1,14 +1,8 @@
-export interface VideoFormat {
-  quality: string;
-  hasAudio: boolean;
-  hasVideo: boolean;
-  container: string;
-  itag: number;
-}
+export type VideoFormat = "audio" | "video";
 
 export interface DownloadOptions {
   url: string;
-  format: "audio" | "video";
+  format: VideoFormat;
   quality?: string;
 }
 
@@ -23,6 +17,14 @@ export interface DownloadResult {
   filename: string;
   filePath: string;
   duration: number; // in seconds
-  format: string;
+  format: VideoFormat;
   size: number; // in bytes
+}
+
+export interface VideoFormatInfo {
+  quality: string;
+  hasAudio: boolean;
+  hasVideo: boolean;
+  container: string;
+  itag: number;
 }
