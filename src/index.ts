@@ -78,17 +78,15 @@ async function downloadVideo(
 
     let quality: number;
     if (options.format === "audio") {
-      quality = 140; // M4A audio (128kbps)
+      quality = 251; // Changed to 251 for better audio quality (WebM Opus)
     } else {
       const availableQualities = streamFormats
         .map((format) => format.itag)
         .filter((itag) => typeof itag === "number") as number[];
 
-      const preferredQualities = [137, 136, 135, 134]; // 1080p, 720p, 480p, 360p
-      quality =
-        preferredQualities.find((q) => availableQualities.includes(q)) || 136;
-
       logger.info(`Available qualities: ${availableQualities.join(", ")}`);
+      // Try to get the best available video quality
+      quality = availableQualities.includes(22) ? 22 : 18; // 720p(22) or 360p(18)
     }
 
     const sanitizedTitle = info.video_details.title
@@ -102,100 +100,89 @@ async function downloadVideo(
     }`;
     const filePath = path.join(DOWNLOAD_DIR, filename);
 
-    const videoStream = await stream(options.url, {
-      quality,
-      ...(options.format === "audio"
-        ? { discordPlayerCompatibility: true }
-        : {}),
-    });
-
-    const writeStream = fs.createWriteStream(filePath);
-    let downloadedBytes = 0;
+    // Get format info for progress calculation
     const selectedFormat = streamFormats.find(
       (format) => format.itag === quality
     );
-    const totalBytes = selectedFormat?.contentLength
+    if (!selectedFormat) {
+      throw new DownloadError(
+        "Selected quality format not available",
+        new Error()
+      );
+    }
+
+    logger.info(`Starting download with quality itag: ${quality}`);
+
+    const videoStream = await stream(options.url, { quality });
+    const writeStream = fs.createWriteStream(filePath);
+    let downloadedBytes = 0;
+    const totalBytes = selectedFormat.contentLength
       ? parseInt(selectedFormat.contentLength)
-      : 0;
+      : (info.video_details.durationInSec * 128000) / 8; // Estimate size for audio
 
-    let lastBytes = 0;
-    let lastTime = Date.now();
-    const updateInterval = setInterval(() => {
-      const currentBytes = downloadedBytes;
-      const currentTime = Date.now();
-      const bytesPerSecond =
-        (currentBytes - lastBytes) / ((currentTime - lastTime) / 1000);
-      lastBytes = currentBytes;
-      lastTime = currentTime;
+    const updateProgress = () => {
+      if (totalBytes) {
+        const percent = ((downloadedBytes / totalBytes) * 100).toFixed(2);
+        const downloaded = (downloadedBytes / 1024 / 1024).toFixed(2);
+        const total = (totalBytes / 1024 / 1024).toFixed(2);
+        spinner.text = `Downloading... ${percent}% (${downloaded}MB / ${total}MB)`;
+      } else {
+        spinner.text = `Downloading... ${(
+          downloadedBytes /
+          1024 /
+          1024
+        ).toFixed(2)}MB`;
+      }
+    };
 
-      const progress: DownloadProgress = {
-        downloadedBytes: currentBytes,
-        totalBytes,
-        percentage: totalBytes ? (currentBytes / totalBytes) * 100 : 0,
-        speed: bytesPerSecond,
-      };
+    return new Promise((resolve, reject) => {
+      const progressInterval = setInterval(updateProgress, 1000);
 
-      const percent = progress.percentage.toFixed(2);
-      const speed = (bytesPerSecond / 1024 / 1024).toFixed(2);
-      spinner.text = `Downloading... ${percent}% (${speed} MB/s)`;
-      logger.info("Download progress", { ...progress, quality });
-    }, 1000);
-
-    const downloadPromise = new Promise<DownloadResult>((resolve, reject) => {
-      writeStream.on("finish", () => {
-        clearInterval(updateInterval);
-        const duration = (Date.now() - startTime) / 1000;
-        const result: DownloadResult = {
-          filename,
-          filePath,
-          duration,
-          format: options.format,
-          size: downloadedBytes,
-        };
-        spinner.succeed(
-          `Download completed in ${duration.toFixed(
-            2
-          )}s! File saved in videos/${filename}`
-        );
-        logger.success("Download completed", result);
-        resolve(result);
-      });
-
-      writeStream.on("error", (error: Error) => {
-        clearInterval(updateInterval);
-        spinner.fail("Error writing file!");
-        reject(new FileSystemError("Write stream error", error));
-      });
-
-      videoStream.stream.on("error", (error: Error) => {
-        clearInterval(updateInterval);
-        spinner.fail("Download error occurred!");
-        const downloadError = new DownloadError("Stream error occurred", error);
-        logger.error(downloadError);
-
-        if (fs.existsSync(filePath)) {
-          try {
+      videoStream.stream
+        .on("data", (chunk: Buffer) => {
+          downloadedBytes += chunk.length;
+        })
+        .on("end", () => {
+          clearInterval(progressInterval);
+        })
+        .on("error", (error: Error) => {
+          clearInterval(progressInterval);
+          spinner.fail("Download error occurred!");
+          if (fs.existsSync(filePath)) {
             fs.unlinkSync(filePath);
-            logger.info("Cleaned up partial download file");
-          } catch (unlinkError) {
-            logger.error(
-              new FileSystemError(
-                "Failed to clean up partial file",
-                unlinkError
-              )
-            );
           }
-        }
-        reject(downloadError);
-      });
-    });
+          reject(new DownloadError("Stream error occurred", error));
+        });
 
-    videoStream.stream.on("data", (chunk: Buffer) => {
-      downloadedBytes += chunk.length;
-    });
+      writeStream
+        .on("finish", () => {
+          clearInterval(progressInterval);
+          const duration = (Date.now() - startTime) / 1000;
+          const result: DownloadResult = {
+            filename,
+            filePath,
+            duration,
+            format: options.format,
+            size: downloadedBytes,
+          };
+          spinner.succeed(
+            `Download completed in ${duration.toFixed(
+              2
+            )}s! File saved in videos/${filename}`
+          );
+          resolve(result);
+        })
+        .on("error", (error: Error) => {
+          clearInterval(progressInterval);
+          spinner.fail("Error writing file!");
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+          }
+          reject(new FileSystemError("Write stream error", error));
+        });
 
-    videoStream.stream.pipe(writeStream);
-    return await downloadPromise;
+      videoStream.stream.pipe(writeStream);
+    });
   } catch (error: unknown) {
     spinner.fail("Download failed!");
     if (error instanceof YouTubeDownloaderError) {
