@@ -20,10 +20,8 @@ import {
 import { logger } from "./utils/logger";
 import { Stream } from "stream";
 
-// Define download directory
 const DOWNLOAD_DIR = path.join(process.cwd(), "videos");
 
-// Ensure download directory exists
 function ensureDownloadDirectory(): void {
   if (!fs.existsSync(DOWNLOAD_DIR)) {
     fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
@@ -33,9 +31,7 @@ function ensureDownloadDirectory(): void {
 
 async function validateYouTubeUrl(url: string): Promise<boolean> {
   try {
-    if (!url) {
-      throw new ValidationError("URL cannot be empty");
-    }
+    if (!url) throw new ValidationError("URL cannot be empty");
     return (await validate(url)) === "yt_video";
   } catch (error) {
     logger.error("URL Validation Error:", error);
@@ -45,7 +41,6 @@ async function validateYouTubeUrl(url: string): Promise<boolean> {
 
 async function getVideoInfo(url: string): Promise<InfoData> {
   try {
-    logger.info(`Fetching video info for: ${url}`);
     const info = await video_info(url);
     logger.success("Video info fetched successfully");
     return info;
@@ -74,38 +69,28 @@ async function downloadVideo(
   options: DownloadOptions
 ): Promise<DownloadResult> {
   const spinner = ora("Starting download...").start();
-  let startTime = Date.now();
+  const startTime = Date.now();
 
   try {
-    // Ensure download directory exists
     ensureDownloadDirectory();
-
-    logger.info("Starting video download", { options });
     const info = await video_info(options.url);
-
-    // Get available formats
     const streamFormats = info.format;
 
-    // Choose appropriate quality
-    let quality: number = 136; // Default to 720p if no preferred quality is available
+    let quality: number;
     if (options.format === "audio") {
-      // Use 140 for M4A audio
-      quality = 140;
+      quality = 140; // M4A audio (128kbps)
     } else {
-      // For video, try to get 1080p, fallback to lower qualities
-      const videoQualities = [137, 136, 135, 134]; // 1080p, 720p, 480p, 360p
-      for (const q of videoQualities) {
-        if (streamFormats.find((format) => format.itag === q)) {
-          quality = q;
-          break;
-        }
-      }
-      quality = quality || 136; // Default to 720p if no preferred quality is available
+      const availableQualities = streamFormats
+        .map((format) => format.itag)
+        .filter((itag) => typeof itag === "number") as number[];
+
+      const preferredQualities = [137, 136, 135, 134]; // 1080p, 720p, 480p, 360p
+      quality =
+        preferredQualities.find((q) => availableQualities.includes(q)) || 136;
+
+      logger.info(`Available qualities: ${availableQualities.join(", ")}`);
     }
 
-    logger.info(`Selected quality itag: ${quality}`);
-
-    // Sanitize filename
     const sanitizedTitle = info.video_details.title
       ? info.video_details.title
           .replace(/[/\\?%*:|"<>]/g, "-")
@@ -115,11 +100,8 @@ async function downloadVideo(
     const filename = `${sanitizedTitle}.${
       options.format === "audio" ? "mp3" : "mp4"
     }`;
-
-    // Create full file path in videos directory
     const filePath = path.join(DOWNLOAD_DIR, filename);
 
-    // Get the stream
     const videoStream = await stream(options.url, {
       quality,
       ...(options.format === "audio"
@@ -129,9 +111,13 @@ async function downloadVideo(
 
     const writeStream = fs.createWriteStream(filePath);
     let downloadedBytes = 0;
-    let totalBytes = info.video_details.durationInSec || 0;
+    const selectedFormat = streamFormats.find(
+      (format) => format.itag === quality
+    );
+    const totalBytes = selectedFormat?.contentLength
+      ? parseInt(selectedFormat.contentLength)
+      : 0;
 
-    // Set up progress tracking
     let lastBytes = 0;
     let lastTime = Date.now();
     const updateInterval = setInterval(() => {
@@ -144,27 +130,24 @@ async function downloadVideo(
 
       const progress: DownloadProgress = {
         downloadedBytes: currentBytes,
-        totalBytes: totalBytes,
+        totalBytes,
         percentage: totalBytes ? (currentBytes / totalBytes) * 100 : 0,
         speed: bytesPerSecond,
       };
 
       const percent = progress.percentage.toFixed(2);
-      const speed = (bytesPerSecond / 1024 / 1024).toFixed(2); // Convert to MB/s
+      const speed = (bytesPerSecond / 1024 / 1024).toFixed(2);
       spinner.text = `Downloading... ${percent}% (${speed} MB/s)`;
-
-      logger.info("Download progress", progress);
+      logger.info("Download progress", { ...progress, quality });
     }, 1000);
 
-    // Set up promise to handle stream completion
     const downloadPromise = new Promise<DownloadResult>((resolve, reject) => {
       writeStream.on("finish", () => {
         clearInterval(updateInterval);
-        const endTime = Date.now();
-        const duration = (endTime - startTime) / 1000; // seconds
+        const duration = (Date.now() - startTime) / 1000;
         const result: DownloadResult = {
-          filename: filename,
-          filePath: filePath,
+          filename,
+          filePath,
           duration,
           format: options.format,
           size: downloadedBytes,
@@ -181,69 +164,53 @@ async function downloadVideo(
       writeStream.on("error", (error: Error) => {
         clearInterval(updateInterval);
         spinner.fail("Error writing file!");
-        const fsError = new FileSystemError("Write stream error", error);
-        logger.error(fsError);
-        reject(fsError);
+        reject(new FileSystemError("Write stream error", error));
+      });
+
+      videoStream.stream.on("error", (error: Error) => {
+        clearInterval(updateInterval);
+        spinner.fail("Download error occurred!");
+        const downloadError = new DownloadError("Stream error occurred", error);
+        logger.error(downloadError);
+
+        if (fs.existsSync(filePath)) {
+          try {
+            fs.unlinkSync(filePath);
+            logger.info("Cleaned up partial download file");
+          } catch (unlinkError) {
+            logger.error(
+              new FileSystemError(
+                "Failed to clean up partial file",
+                unlinkError
+              )
+            );
+          }
+        }
+        reject(downloadError);
       });
     });
 
-    // Handle stream errors
-    videoStream.stream.on("error", (error: Error) => {
-      clearInterval(updateInterval);
-      spinner.fail("Download error occurred!");
-      const downloadError = new DownloadError("Stream error occurred", error);
-      logger.error(downloadError);
-
-      // Clean up partial file
-      if (fs.existsSync(filePath)) {
-        try {
-          fs.unlinkSync(filePath);
-          logger.info("Cleaned up partial download file");
-        } catch (unlinkError) {
-          logger.error(
-            new FileSystemError("Failed to clean up partial file", unlinkError)
-          );
-        }
-      }
-      throw downloadError;
-    });
-
-    // Track download progress
     videoStream.stream.on("data", (chunk: Buffer) => {
       downloadedBytes += chunk.length;
     });
 
-    // Start the download
     videoStream.stream.pipe(writeStream);
-
     return await downloadPromise;
   } catch (error: unknown) {
     spinner.fail("Download failed!");
     if (error instanceof YouTubeDownloaderError) {
-      logger.error(error);
       throw error;
-    } else if (error instanceof Error) {
-      const downloadError = new DownloadError(
-        "Download failed with unknown error",
-        error
-      );
-      logger.error(downloadError);
-      throw downloadError;
-    } else {
-      const unknownError = new DownloadError(
-        "Download failed with unknown error",
-        new Error(String(error))
-      );
-      logger.error(unknownError);
-      throw unknownError;
     }
+    throw new DownloadError(
+      "Download failed with unknown error",
+      error instanceof Error ? error : new Error(String(error))
+    );
   }
 }
 
 async function main() {
   try {
     logger.info("Starting YouTube Downloader");
-
     const answers = await inquirer.prompt([
       {
         type: "input",
@@ -288,7 +255,6 @@ async function main() {
   }
 }
 
-// Handle uncaught errors
 process.on("uncaughtException", (error) => {
   logger.error("Uncaught Exception:", error);
   process.exit(1);
